@@ -1,6 +1,6 @@
 flask
 flask-cors
-opengradient==0.7.5
+opengradient>=9.0.0
 requests
 python-dotenv
 gunicorn
