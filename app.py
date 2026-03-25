@@ -1,16 +1,10 @@
-"""
-CV Analyzer Backend
-====================
-pip install flask flask-cors opengradient python-dotenv gunicorn
-
-.env:
-  OG_PRIVATE_KEY=0x...
-
-Run:
-  python cv-backend.py
-"""
-
-import os, json, re, time, base64
+import os
+import json
+import re
+import time
+import asyncio
+import threading
+import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -21,9 +15,23 @@ CORS(app)
 
 # ── OpenGradient ──────────────────────────────────────────────────────────────
 OG_OK = False
-client = None
-og = None
+llm_client = None
 WORKING_MODEL = None
+
+# Единый event loop в отдельном потоке
+_loop = None
+_loop_thread = None
+
+def _start_loop():
+    global _loop
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+
+def _run(coro):
+    """Запустить корутину в фоновом event loop и дождаться результата."""
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result(timeout=120)
 
 MODEL_PRIORITY = [
     "GEMINI_2_5_FLASH_LITE",
@@ -39,43 +47,163 @@ MODEL_PRIORITY = [
 ]
 
 try:
-    import opengradient as _og
-    import ssl, urllib3
-    og = _og
+    import opengradient as og
+    import ssl
+    import urllib3
+
     ssl._create_default_https_context = ssl._create_unverified_context
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    client = og.Client(private_key=os.environ["OG_PRIVATE_KEY"])
+
+    # Запускаем фоновый event loop
+    _loop_thread = threading.Thread(target=_start_loop, daemon=True)
+    _loop_thread.start()
+    time.sleep(0.2)  # ждём пока loop запустится
+
+    private_key = os.environ["OG_PRIVATE_KEY"]
+    llm_client = og.LLM(private_key=private_key)
+
+    # Approve токенов при старте
+    try:
+        approval = llm_client.ensure_opg_approval(opg_amount=10)
+        print(f"OPG approval: {approval}")
+    except Exception as e:
+        print(f"Approval warning: {e}")
+
     OG_OK = True
     print("OG connected")
 except Exception as e:
     print(f"Demo mode: {e}")
+    OG_OK = False
+    llm_client = None
 
 
+# ── Поиск рабочей модели ──────────────────────────────────────────────────────
 def probe_models():
     global WORKING_MODEL
-    if not OG_OK or client is None:
+    if not OG_OK or llm_client is None:
         return
-    available = dir(og.TEE_LLM)
-    print(f"Available models: {[m for m in available if not m.startswith('_')]}")
+
+    print("Probing models...")
     for name in MODEL_PRIORITY:
         if not hasattr(og.TEE_LLM, name):
             continue
-        model = getattr(og.TEE_LLM, name)
+        model_enum = getattr(og.TEE_LLM, name)
         try:
-            print(f"Probing {name}...")
-            result = client.llm.chat(
-                model=model,
+            print(f"Testing {name}...")
+            result = _run(llm_client.chat(
+                model=model_enum,
                 messages=[{"role": "user", "content": "Reply: OK"}],
                 max_tokens=5,
                 temperature=0.0,
-            )
+            ))
             raw = extract_raw(result)
-            WORKING_MODEL = model
-            print(f"✓ Using model: {name}")
-            return
+            if raw.strip():
+                WORKING_MODEL = model_enum
+                print(f"Using model: {name}")
+                return
         except Exception as e:
-            print(f"  FAIL: {e}")
+            print(f"  FAIL {name}: {e}")
     print("No working model found.")
+
+
+# ── Извлечение текста из ответа ───────────────────────────────────────────────
+def extract_raw(result):
+    if not result:
+        return ""
+    co = getattr(result, 'chat_output', None)
+    if co:
+        if isinstance(co, dict):
+            for k in ('content', 'text', 'message', 'response', 'output'):
+                if co.get(k):
+                    return str(co[k])
+        elif isinstance(co, str):
+            return co
+    comp = getattr(result, 'completion_output', None)
+    if comp and str(comp).strip():
+        return str(comp)
+    if hasattr(result, 'text'):
+        return result.text
+    for attr in dir(result):
+        if attr.startswith('_'):
+            continue
+        try:
+            val = getattr(result, attr)
+            if callable(val):
+                continue
+            if isinstance(val, str) and ('<JSON>' in val or '"overall_score"' in val):
+                return val
+        except:
+            pass
+    return ""
+
+
+def parse_json(raw):
+    if not raw or not raw.strip():
+        return {"error": "Empty response"}
+    m = re.search(r"<JSON>(.*?)</JSON>", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except Exception as e:
+            print(f"JSON parse error: {e}")
+    m = re.search(r'\{[\s\S]*?"overall_score"[\s\S]*\}', raw)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except:
+            pass
+    return {"error": "Parse failed", "raw": raw[:300]}
+
+
+def call_llm(messages, retries=3):
+    global WORKING_MODEL
+    if not OG_OK or llm_client is None:
+        return {"error": "OpenGradient not available"}
+
+    if WORKING_MODEL is None:
+        probe_models()
+    if WORKING_MODEL is None:
+        return {"error": "No working model found"}
+
+    last_error = ""
+    for attempt in range(retries):
+        try:
+            print(f"LLM attempt {attempt+1} | model: {WORKING_MODEL}")
+            result = _run(llm_client.chat(
+                model=WORKING_MODEL,
+                messages=messages,
+                max_tokens=3000,
+                temperature=0.3,
+            ))
+            raw = extract_raw(result)
+            if not raw.strip():
+                last_error = "Empty response"
+                time.sleep(2)
+                continue
+            parsed = parse_json(raw)
+            if "error" in parsed:
+                last_error = parsed["error"]
+                time.sleep(1)
+                continue
+            tx = getattr(result, "transaction_hash", None)
+            if tx:
+                parsed["proof"] = {
+                    "transaction_hash": tx,
+                    "explorer_url": f"https://explorer.opengradient.ai/tx/{tx}",
+                }
+            return parsed
+        except Exception as e:
+            last_error = str(e)
+            print(f"LLM error attempt {attempt+1}: {e}")
+            if "402" in str(e):
+                WORKING_MODEL = None
+                probe_models()
+                if WORKING_MODEL is None:
+                    break
+            else:
+                time.sleep(2)
+
+    return {"error": f"All attempts failed: {last_error}"}
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -136,109 +264,14 @@ Rules:
 """
 
 
-def extract_raw(result):
-    candidates = []
-    co = getattr(result, 'chat_output', None)
-    if co:
-        if isinstance(co, dict):
-            for k in ('content', 'text', 'message', 'response', 'output'):
-                if co.get(k): candidates.append(str(co[k]))
-        elif isinstance(co, str) and co.strip():
-            candidates.append(co)
-        elif isinstance(co, list) and co:
-            first = co[0]
-            if isinstance(first, dict):
-                for k in ('content', 'text'):
-                    if first.get(k): candidates.append(str(first[k]))
-                if first.get('message', {}).get('content'):
-                    candidates.append(first['message']['content'])
-    comp = getattr(result, 'completion_output', None)
-    if comp and str(comp).strip():
-        candidates.append(str(comp))
-    for attr in dir(result):
-        if attr.startswith('_'): continue
-        try:
-            val = getattr(result, attr)
-            if callable(val): continue
-            if isinstance(val, str) and ('<JSON>' in val or '"overall_score"' in val):
-                candidates.append(val)
-        except: pass
-    return candidates[0] if candidates else ""
-
-
-def parse_json(raw):
-    if not raw or not raw.strip():
-        return {"error": "Empty response"}
-    m = re.search(r"<JSON>(.*?)</JSON>", raw, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1).strip())
-        except Exception as e:
-            print(f"JSON parse error: {e}")
-    m = re.search(r'\{[\s\S]*?"overall_score"[\s\S]*\}', raw)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except:
-            pass
-    return {"error": "Parse failed", "raw": raw[:300]}
-
-
-def call_llm(messages, retries=3):
-    global WORKING_MODEL
-    if not OG_OK or client is None:
-        return {"error": "OpenGradient not available"}
-
-    if WORKING_MODEL is None:
-        probe_models()
-    if WORKING_MODEL is None:
-        return {"error": "No working model found"}
-
-    last_error = ""
-    for attempt in range(retries):
-        try:
-            print(f"LLM attempt {attempt+1} | model: {WORKING_MODEL}")
-            result = client.llm.chat(
-                model=WORKING_MODEL,
-                messages=messages,
-                max_tokens=3000,
-                temperature=0.3,
-            )
-            raw = extract_raw(result)
-            if not raw.strip():
-                last_error = "Empty response"
-                time.sleep(2)
-                continue
-            parsed = parse_json(raw)
-            if "error" in parsed:
-                last_error = parsed["error"]
-                time.sleep(1)
-                continue
-            tx = getattr(result, "transaction_hash", None)
-            if tx:
-                parsed["proof"] = {
-                    "transaction_hash": tx,
-                    "explorer_url": f"https://explorer.opengradient.ai/tx/{tx}",
-                }
-            return parsed
-        except Exception as e:
-            last_error = str(e)
-            print(f"LLM error attempt {attempt+1}: {e}")
-            if "402" in str(e):
-                WORKING_MODEL = None
-                probe_models()
-                if WORKING_MODEL is None:
-                    break
-            else:
-                time.sleep(2)
-
-    return {"error": f"All attempts failed: {last_error}"}
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "og": OG_OK, "model": str(WORKING_MODEL) if WORKING_MODEL else None})
+    return jsonify({
+        "status": "ok",
+        "og": OG_OK,
+        "model": str(WORKING_MODEL) if WORKING_MODEL else None,
+    })
 
 
 @app.route("/analyze", methods=["POST"])
@@ -255,7 +288,6 @@ def analyze():
 
     user_content = []
 
-    # PDF input
     if pdf_base64:
         try:
             user_content.append({
@@ -271,10 +303,9 @@ def analyze():
             print(f"PDF error: {e}")
             return jsonify({"error": "Failed to process PDF"}), 400
 
-    # Text input
     if cv_text:
         user_content.append({"type": "text", "text": f"CV TEXT:\n\n{cv_text}"})
-    
+
     role_note = f"\n\nTarget role: {target_role}" if target_role else ""
     user_content.append({"type": "text", "text": f"Please analyze this CV and return the JSON.{role_note}"})
 
@@ -290,5 +321,6 @@ def analyze():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     print(f"CV Analyzer on :{port} | OG: {'live' if OG_OK else 'demo'}")
-    probe_models()
-    app.run(host="0.0.0.0", port=port, debug=True)
+    if OG_OK:
+        probe_models()
+    app.run(host="0.0.0.0", port=port, debug=False)
